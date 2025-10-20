@@ -311,8 +311,7 @@ The code is used to train:
 
 - **Dataset**: Al-Dhabyani et al. "Dataset of breast ultrasound images" (2020)
 - **GrowNet**: Badirli et al. "Gradient Boosting Neural Networks: GrowNet" (2020)
-- **U-Net**: Ronneberger et al. "U-Net: Convolutional Networks for Biomedical Image Segmentation" (2015)
-- **Segmentation Models PyTorch**: [qubvel/segmentation_models.pytorch](https://github.com/qubvel/segmentation_models.pytorch)
+- **ACA-Res-U-Net**
 
 ## 📄 License
 
