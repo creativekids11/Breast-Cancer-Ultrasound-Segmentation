@@ -18,7 +18,7 @@ A comprehensive implementation of breast cancer ultrasound image segmentation us
 
 | Model Architecture | Dice Score | IoU Score | Training Time | Parameters |
 |-------------------|------------|-----------|---------------|------------|
-| Baseline U-Net (ResNet34) | 66.4% | ~49.7% | ~2 hours | ~24M |
+| Baseline ACA-Res-U-Net (ResNet34) | 66.4% | ~49.7% | ~2 hours | ~24M |
 | **6-Stage Gradient Boosting** | **73.0%** | **~57.5%** | ~6 hours | ~30M |
 
 ## 🚀 Quick Start
