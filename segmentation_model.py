@@ -334,6 +334,102 @@ class ACAAtrousResUNet(nn.Module):
         return F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
 
 # ----------------------------
+# Boosting Model Architectures
+# ----------------------------
+class EnsembleModel(nn.Module):
+    """Ensemble of multiple models with weighted averaging."""
+    def __init__(self, models: List[nn.Module], weights: List[float] = None):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+        if weights is None:
+            weights = [1.0 / len(models)] * len(models)
+        self.register_buffer('weights', torch.tensor(weights))
+        
+    def forward(self, x):
+        outputs = []
+        for model in self.models:
+            out = model(x)
+            if isinstance(out, tuple):
+                out = out[0]
+            outputs.append(out)
+        
+        # Weighted average
+        weighted_sum = sum(w * out for w, out in zip(self.weights, outputs))
+        return weighted_sum
+
+class CascadeModel(nn.Module):
+    """Cascade of models where each subsequent model refines the previous prediction."""
+    def __init__(self, models: List[nn.Module]):
+        super().__init__()
+        self.models = nn.ModuleList(models)
+        
+    def forward(self, x, return_all=False):
+        predictions = []
+        current_input = x
+        
+        for i, model in enumerate(self.models):
+            pred = model(current_input)
+            if isinstance(pred, tuple):
+                pred = pred[0]
+            predictions.append(pred)
+            
+            # For subsequent models, concatenate original input with previous prediction
+            if i < len(self.models) - 1:
+                prev_pred_sigmoid = torch.sigmoid(pred)
+                current_input = torch.cat([x, prev_pred_sigmoid], dim=1)
+                
+        if return_all:
+            return predictions
+        return predictions[-1]  # Return final prediction
+
+class AdaptiveBoostingModel(nn.Module):
+    """Adaptive boosting model that focuses on hard examples."""
+    def __init__(self, base_model_fn, num_boosters: int = 3, in_ch: int = 1):
+        super().__init__()
+        self.num_boosters = num_boosters
+        self.models = nn.ModuleList()
+        
+        # First model uses original input
+        self.models.append(base_model_fn(in_ch=in_ch))
+        
+        # Subsequent models get additional channels (error maps)
+        for i in range(1, num_boosters):
+            self.models.append(base_model_fn(in_ch=in_ch + i))
+            
+        # Learnable combination weights
+        self.combination_weights = nn.Parameter(torch.ones(num_boosters) / num_boosters)
+        
+    def forward(self, x, return_all=False):
+        predictions = []
+        error_maps = []
+        current_input = x
+        
+        for i, model in enumerate(self.models):
+            pred = model(current_input)
+            if isinstance(pred, tuple):
+                pred = pred[0]
+            predictions.append(pred)
+            
+            if i < len(self.models) - 1:
+                # Create error map for next model
+                pred_sigmoid = torch.sigmoid(pred)
+                # Use gradient magnitude as error indicator
+                with torch.enable_grad():
+                    if not pred.requires_grad:
+                        pred.requires_grad_(True)
+                    grad_x = torch.autograd.grad(pred.sum(), pred, create_graph=True)[0]
+                    error_map = torch.norm(grad_x, dim=1, keepdim=True)
+                    error_maps.append(error_map)
+                    current_input = torch.cat([x] + error_maps, dim=1)
+                    
+        if return_all:
+            return predictions
+        
+        # Weighted combination
+        combined = sum(w * pred for w, pred in zip(self.combination_weights, predictions))
+        return combined
+
+# ----------------------------
 # Loss, Metrics & Regularization
 # ----------------------------
 class DiceBCELoss(nn.Module):
@@ -349,6 +445,43 @@ class DiceBCELoss(nn.Module):
         intersection = (inputs_sigmoid * targets_flat).sum()
         dice_score = (2. * intersection + self.smooth) / (inputs_sigmoid.sum() + targets_flat.sum() + self.smooth)
         return bce + (1 - dice_score)
+
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance."""
+    def __init__(self, alpha: float = 1.0, gamma: float = 2.0, smooth: float = 1e-5):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.smooth = smooth
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor = None) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none', pos_weight=pos_weight)
+        pt = torch.exp(-bce)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * bce
+        return focal_loss.mean()
+
+class AdaptiveLoss(nn.Module):
+    """Adaptive loss that focuses on hard examples."""
+    def __init__(self, smooth: float = 1e-5, alpha: float = 0.7):
+        super().__init__()
+        self.smooth = smooth
+        self.alpha = alpha
+        self.dice_bce = DiceBCELoss(smooth)
+        self.focal = FocalLoss(gamma=2.0, smooth=smooth)
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor, 
+                prev_pred: torch.Tensor = None) -> torch.Tensor:
+        base_loss = self.dice_bce(inputs, targets, pos_weight)
+        
+        if prev_pred is not None:
+            # Focus on areas where previous model failed
+            prev_error = torch.abs(torch.sigmoid(prev_pred) - targets)
+            weight_mask = (prev_error > 0.3).float()  # Focus on high error regions
+            weighted_inputs = inputs * (1 + weight_mask)
+            adaptive_loss = self.focal(weighted_inputs, targets, pos_weight)
+            return self.alpha * base_loss + (1 - self.alpha) * adaptive_loss
+        
+        return base_loss
 
 def l1_regularization(model: nn.Module, l1_lambda: float) -> torch.Tensor:
     return l1_lambda * sum(p.abs().sum() for p in model.parameters() if p.requires_grad)
@@ -375,23 +508,65 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=args.logdir)
         self.best_val_dice = 0.0
         self.pos_weight = torch.tensor([args.pos_weight], device=self.device)
+        self.is_boosting = args.enable_boosting
+        self.boost_type = args.boost_type if args.enable_boosting else None
         os.makedirs(args.outdir, exist_ok=True)
+        
+        # Store previous predictions for adaptive boosting
+        self.prev_predictions = {}
 
     def _train_epoch(self, epoch: int):
         self.model.train()
         total_loss = 0.0
         pbar = tqdm(self.train_loader, desc=f"Train E{epoch}/{self.args.epochs}")
         n_batches = len(self.train_loader)
+        
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs, masks = imgs.to(self.device), masks.to(self.device)
+            batch_key = f"{epoch}_{batch_idx}"
 
             self.optimizer.zero_grad()
 
-            pred = self.model(imgs)
-            if isinstance(pred, tuple):  # Handle Connect-UNets output
-                pred = pred[0]
+            if self.is_boosting and self.boost_type == "adaptive":
+                # Adaptive boosting with previous predictions
+                prev_pred = self.prev_predictions.get(batch_key, None)
+                pred = self.model(imgs)
+                
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+                    
+                if hasattr(self.criterion, 'forward') and 'prev_pred' in self.criterion.forward.__code__.co_varnames:
+                    loss = self.criterion(pred, masks, pos_weight=self.pos_weight, prev_pred=prev_pred)
+                else:
+                    loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
+                    
+                # Store prediction for next boosting round
+                with torch.no_grad():
+                    self.prev_predictions[batch_key] = pred.detach()
+                    
+            elif self.is_boosting and self.boost_type == "cascade":
+                # Cascade boosting
+                pred = self.model(imgs, return_all=True) if hasattr(self.model, 'forward') else self.model(imgs)
+                
+                if isinstance(pred, list):
+                    # Multi-stage loss
+                    total_stage_loss = 0
+                    for i, stage_pred in enumerate(pred):
+                        stage_weight = 0.5 ** (len(pred) - 1 - i)  # Give more weight to later stages
+                        stage_loss = self.criterion(stage_pred, masks, pos_weight=self.pos_weight)
+                        total_stage_loss += stage_weight * stage_loss
+                    loss = total_stage_loss
+                    pred = pred[-1]  # Use final prediction for metrics
+                else:
+                    loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
+                    
+            else:
+                # Standard training
+                pred = self.model(imgs)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+                loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
 
-            loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
             l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
             total_loss_with_reg = loss + l1_penalty
 
@@ -419,6 +594,7 @@ class Trainer:
         self.model.eval()
         val_loss, val_dice = 0, 0
         pbar = tqdm(self.val_loader, desc=f"Val E{epoch}/{self.args.epochs}")
+        
         with torch.no_grad():
             for imgs, masks in pbar:
                 imgs, masks = imgs.to(self.device), masks.to(self.device)
@@ -426,8 +602,10 @@ class Trainer:
                 pred = self.model(imgs)
                 if isinstance(pred, tuple):
                     pred = pred[0]
+                elif isinstance(pred, list):
+                    pred = pred[-1]  # Use final prediction for cascade models
 
-                loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
+                loss = self.criterion(pred, masks, pos_weight=self.pos_weight) if not hasattr(self.criterion, 'forward') or 'prev_pred' not in self.criterion.forward.__code__.co_varnames else self.criterion(pred, masks, pos_weight=self.pos_weight, prev_pred=None)
                 val_loss += loss.item()
 
                 preds_sigmoid = torch.sigmoid(pred)
@@ -463,10 +641,11 @@ class Trainer:
             pred_logits = self.model(img)
             if isinstance(pred_logits, tuple):
                 pred_logits = pred_logits[0]
+            elif isinstance(pred_logits, list):
+                pred_logits = pred_logits[-1]
             pred_prob = torch.sigmoid(pred_logits)
 
         def to_rgb(x: torch.Tensor) -> torch.Tensor:
-            # x: 1xHxW or 3xHxW; we want 3xHxW rgb-like tensor for TB
             t = x.squeeze(0).cpu()
             if t.shape[0] == 1:
                 return t.repeat(3, 1, 1)
@@ -513,6 +692,19 @@ def get_args() -> argparse.Namespace:
 
     p.add_argument("--check-masks", action="store_true",
                help="Quickly save a few image+mask overlay PNGs to outdir/check_masks for visual inspection.")
+
+    # Checkpoint Loading
+    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from.")
+    p.add_argument("--pretrained", type=str, default=None, help="Path to pretrained model weights (e.g., best.pth).")
+    
+    # Boosting Options
+    p.add_argument("--enable-boosting", action="store_true", help="Enable boosting techniques for better performance.")
+    p.add_argument("--boost-type", type=str, default="ensemble", 
+                   choices=["ensemble", "cascade", "adaptive", "focal"], 
+                   help="Type of boosting to use.")
+    p.add_argument("--num-boosters", type=int, default=3, help="Number of boosting rounds/models.")
+    p.add_argument("--boost-lr-decay", type=float, default=0.5, help="Learning rate decay for each booster.")
+    p.add_argument("--adaptive-threshold", type=float, default=0.3, help="Threshold for adaptive boosting.")
 
     # CosineAnnealingWarmRestarts options
     p.add_argument("--t0", type=int, default=12, help="T_0 for CosineAnnealingWarmRestarts (first restart epoch count).")
@@ -657,27 +849,92 @@ def load_model_from_checkpoint(ckpt_path: str, preferred_model_name: str = "aca-
         return model, "\n".join(info_lines), chosen
 
 # Replace or call this helper in create_model if you prefer:
-def create_model(model_name: str, device: torch.device, img_size: int, checkpoint_path: str = None) -> nn.Module:
+def create_model(model_name: str, device: torch.device, img_size: int, checkpoint_path: str = None, 
+                 enable_boosting: bool = False, boost_type: str = "ensemble", num_boosters: int = 3) -> nn.Module:
     """
-    Instantiates the selected model and optionally loads checkpoint via load_model_from_checkpoint to
-    auto-detect architecture and partially load weights where possible.
+    Instantiates the selected model with optional boosting and checkpoint loading.
     """
+    def get_base_model(in_ch=1):
+        models: Dict[str, nn.Module] = {
+            "aca-atrous-unet": ACAAtrousUNet(in_ch=in_ch, out_ch=1, base_ch=64),
+            "connect-unet": ConnectUNets(in_ch=in_ch, out_ch=1, base_ch=64),
+            "smp-unet-resnet34": smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=in_ch, classes=1),
+            "aca-atrous-resunet": ACAAtrousResUNet(in_ch=in_ch, out_ch=1)
+        }
+        if model_name not in models:
+            raise ValueError(f"Unknown model name: {model_name}. Available models: {list(models.keys())}")
+        return models[model_name]
+    
+    if enable_boosting:
+        print(f"Creating boosted model with type: {boost_type}")
+        
+        if boost_type == "ensemble":
+            # Create multiple models with different initializations
+            models = []
+            for i in range(num_boosters):
+                base_model = get_base_model()
+                models.append(base_model)
+            model = EnsembleModel(models)
+            
+        elif boost_type == "cascade":
+            # Create cascade of models
+            models = []
+            for i in range(num_boosters):
+                # First model takes original input, subsequent models get additional channels
+                in_channels = 1 if i == 0 else 2
+                if model_name == "connect-unet":
+                    # ConnectUNets already handles cascading internally
+                    base_model = get_base_model(in_ch=1)
+                else:
+                    base_model = get_base_model(in_ch=in_channels)
+                models.append(base_model)
+            model = CascadeModel(models)
+            
+        elif boost_type == "adaptive":
+            # Create adaptive boosting model
+            model = AdaptiveBoostingModel(
+                base_model_fn=lambda in_ch: get_base_model(in_ch),
+                num_boosters=num_boosters,
+                in_ch=1
+            )
+            
+        else:
+            raise ValueError(f"Unknown boost_type: {boost_type}")
+            
+    else:
+        # Single model without boosting
+        model = get_base_model()
+
+    model = model.to(device)
+
+    # Load checkpoint if provided
     if checkpoint_path is not None:
-        model, info, chosen = load_model_from_checkpoint(checkpoint_path, preferred_model_name=model_name, device=device, img_size=img_size)
-        print(f"[MODEL LOAD] preferred={model_name}, chosen={chosen}. Info:\n{info}")
-        return model
+        if enable_boosting:
+            print(f"[WARN] Loading checkpoint into boosted model - attempting to load into first/base model")
+            # For boosted models, try to load into the first model
+            try:
+                if hasattr(model, 'models') and len(model.models) > 0:
+                    first_model = model.models[0]
+                    loaded_model, info, chosen = load_model_from_checkpoint(
+                        checkpoint_path, preferred_model_name=model_name, 
+                        device=device, img_size=img_size
+                    )
+                    # Copy weights to first model
+                    first_model.load_state_dict(loaded_model.state_dict(), strict=False)
+                    print(f"[MODEL LOAD] Loaded checkpoint into first booster model. Info:\n{info}")
+                else:
+                    print("[WARN] Could not load checkpoint into boosted model - no accessible sub-models")
+            except Exception as e:
+                print(f"[WARN] Failed to load checkpoint into boosted model: {e}")
+        else:
+            # Single model loading
+            model, info, chosen = load_model_from_checkpoint(
+                checkpoint_path, preferred_model_name=model_name, 
+                device=device, img_size=img_size
+            )
+            print(f"[MODEL LOAD] preferred={model_name}, chosen={chosen}. Info:\n{info}")
 
-    # original behavior if no checkpoint requested
-    models: Dict[str, nn.Module] = {
-        "aca-atrous-unet": ACAAtrousUNet(in_ch=1, out_ch=1, base_ch=64),
-        "connect-unet": ConnectUNets(in_ch=1, out_ch=1, base_ch=64),
-        "smp-unet-resnet34": smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=1, classes=1),
-        "aca-atrous-resunet": ACAAtrousResUNet(in_ch=1, out_ch=1)
-    }
-    if model_name not in models:
-        raise ValueError(f"Unknown model name: {model_name}. Available models: {list(models.keys())}")
-
-    model = models[model_name].to(device)
+    # Initialize with dummy forward pass
     try:
         model.eval()
         with torch.no_grad():
@@ -686,7 +943,9 @@ def create_model(model_name: str, device: torch.device, img_size: int, checkpoin
         model.train()
     except Exception as e:
         print(f"[WARN] Dummy init forward failed: {e}; lazy modules (if any) may not be registered for optimizer.")
-    print(f"Using model: {model_name}")
+    
+    boost_info = f" (boosted: {boost_type})" if enable_boosting else ""
+    print(f"Using model: {model_name}{boost_info}")
     return model
 
 def main():
@@ -694,12 +953,51 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # Check for mask visualization
+    if args.check_masks:
+        check_masks(args)
+        return
+
     train_loader, val_loader = setup_dataloaders(args)
 
-    model = create_model(args.model, device, img_size=args.img_size)
+    # Determine checkpoint path
+    checkpoint_path = None
+    if args.resume:
+        checkpoint_path = args.resume
+        print(f"Resuming training from: {checkpoint_path}")
+    elif args.pretrained:
+        checkpoint_path = args.pretrained
+        print(f"Starting with pretrained weights: {checkpoint_path}")
 
-    criterion = DiceBCELoss(smooth=1e-5)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
+    # Create model with boosting support
+    model = create_model(
+        args.model, 
+        device, 
+        img_size=args.img_size, 
+        checkpoint_path=checkpoint_path,
+        enable_boosting=args.enable_boosting,
+        boost_type=args.boost_type,
+        num_boosters=args.num_boosters
+    )
+
+    # Select appropriate loss function based on boosting type
+    if args.enable_boosting and args.boost_type == "focal":
+        criterion = FocalLoss(alpha=1.0, gamma=2.0, smooth=1e-5)
+        print("Using Focal Loss for boosting")
+    elif args.enable_boosting and args.boost_type == "adaptive":
+        criterion = AdaptiveLoss(smooth=1e-5, alpha=0.7)
+        print("Using Adaptive Loss for boosting")
+    else:
+        criterion = DiceBCELoss(smooth=1e-5)
+        print("Using DiceBCE Loss")
+
+    # Adjust learning rate for boosting
+    learning_rate = args.lr
+    if args.enable_boosting:
+        learning_rate = args.lr * (args.boost_lr_decay ** 0)  # Start with base LR
+        print(f"Adjusted learning rate for boosting: {learning_rate}")
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4, nesterov=True)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
@@ -718,6 +1016,18 @@ def main():
         val_loader=val_loader,
         args=args
     )
+    
+    print(f"Training configuration:")
+    print(f"  Model: {args.model}")
+    print(f"  Boosting: {'Enabled' if args.enable_boosting else 'Disabled'}")
+    if args.enable_boosting:
+        print(f"  Boost Type: {args.boost_type}")
+        print(f"  Num Boosters: {args.num_boosters}")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Batch Size: {args.batch_size}")
+    print(f"  Learning Rate: {learning_rate}")
+    print(f"  Image Size: {args.img_size}")
+    
     trainer.run()
 
 if __name__ == "__main__":
