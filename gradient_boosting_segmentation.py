@@ -216,150 +216,27 @@ class GradientBoostingSegmentation(nn.Module):
     Similar to GrowNet but adapted for dense prediction tasks.
     """
     def __init__(self, weak_learner_factory, num_boosters=10, learning_rate=0.1, 
-                 input_channels=1, output_channels=1, pretrained_path=None, device='cuda'):
+                 input_channels=1, output_channels=1):
         super().__init__()
         
         self.num_boosters = num_boosters
         self.learning_rate = learning_rate
         self.input_channels = input_channels
-        self.device = device
         
         # Store weak learners
         self.weak_learners = nn.ModuleList()
         
         # Learnable combination weights (like GrowNet)
-        self.alphas = nn.Parameter(torch.ones(num_boosters) * learning_rate)
+        # Initialize first booster with full weight (1.0), others with learning rate
+        alphas_init = torch.ones(num_boosters) * learning_rate
+        alphas_init[0] = 1.0  # Full weight for first (pre-trained) booster
+        self.alphas = nn.Parameter(alphas_init)
         
         # Factory function to create weak learners
         self.weak_learner_factory = weak_learner_factory
         
         # Initialize first weak learner
-        first_learner = weak_learner_factory(input_channels)
-        
-        # Load pretrained weights if provided
-        if pretrained_path is not None and os.path.exists(pretrained_path):
-            print(f"Loading pretrained weights from: {pretrained_path}")
-            try:
-                # Load checkpoint
-                checkpoint = torch.load(pretrained_path, map_location=self.device, weights_only=False)
-                
-                # Handle different checkpoint formats
-                if isinstance(checkpoint, dict):
-                    if 'state_dict' in checkpoint:
-                        state_dict = checkpoint['state_dict']
-                    elif 'model_state_dict' in checkpoint:
-                        state_dict = checkpoint['model_state_dict']
-                    else:
-                        state_dict = checkpoint
-                
-                # Smart loading: try to match layers by pattern and shape
-                model_state = first_learner.state_dict()
-                loaded_keys = []
-                skipped_keys = []
-                
-                # First pass: exact matches
-                for k, v in state_dict.items():
-                    clean_key = k.replace('module.', '')
-                    if clean_key in model_state and model_state[clean_key].shape == v.shape:
-                        model_state[clean_key] = v
-                        loaded_keys.append(clean_key)
-                    else:
-                        skipped_keys.append(k)
-                
-                # Second pass: try to match by layer patterns (e.g., first conv layers)
-                if len(loaded_keys) == 0:  # If no exact matches, try pattern matching
-                    print("No exact matches found, trying pattern-based loading...")
-                    
-                    # Get shallow network's conv layers (only weight parameters)
-                    shallow_convs = [(k, model_state[k]) for k in model_state.keys() 
-                                   if 'conv' in k and k.endswith('.weight') and len(model_state[k].shape) == 4]
-                    
-                    # Get pretrained conv layers (prioritize early layers)
-                    pretrained_convs = [(k, v) for k, v in state_dict.items() 
-                                      if 'conv' in k and k.endswith('.weight') and len(v.shape) == 4]
-                    pretrained_convs.sort(key=lambda x: x[0])  # Sort by name
-                    
-                    print(f"Found {len(shallow_convs)} shallow conv layers, {len(pretrained_convs)} pretrained conv layers")
-                    
-                    # Try to match first few conv layers
-                    for i, (shallow_key, shallow_weight) in enumerate(shallow_convs):
-                        if i < len(pretrained_convs):
-                            pretrained_key, pretrained_weight = pretrained_convs[i]
-                            
-                            # Check if shapes are compatible
-                            shallow_shape = shallow_weight.shape
-                            pretrained_shape = pretrained_weight.shape
-                            
-                            try:
-                                if shallow_shape == pretrained_shape:
-                                    model_state[shallow_key] = pretrained_weight
-                                    loaded_keys.append(shallow_key)
-                                    print(f"  ✓ Matched {shallow_key} <- {pretrained_key}")
-                                elif (shallow_shape[1] == pretrained_shape[1] and 
-                                      shallow_shape[0] <= pretrained_shape[0]):
-                                    # Can use subset of output channels
-                                    model_state[shallow_key] = pretrained_weight[:shallow_shape[0]]
-                                    loaded_keys.append(shallow_key)
-                                    print(f"  ✓ Adapted {shallow_key} <- {pretrained_key} ({pretrained_shape} -> {shallow_shape})")
-                                elif (shallow_shape[1] == pretrained_shape[1] and 
-                                      pretrained_shape[2] >= shallow_shape[2] and 
-                                      pretrained_shape[3] >= shallow_shape[3]):
-                                    # Try center crop for kernel size (e.g., 7x7 -> 3x3)
-                                    h_diff = pretrained_shape[2] - shallow_shape[2]
-                                    w_diff = pretrained_shape[3] - shallow_shape[3]
-                                    h_start = h_diff // 2
-                                    w_start = w_diff // 2
-                                    cropped_weight = pretrained_weight[:, :, h_start:h_start+shallow_shape[2], w_start:w_start+shallow_shape[3]]
-                                    
-                                    # Handle output channel mismatch
-                                    if cropped_weight.shape[0] > shallow_shape[0]:
-                                        cropped_weight = cropped_weight[:shallow_shape[0]]
-                                    elif cropped_weight.shape[0] < shallow_shape[0]:
-                                        # Pad with zeros if needed (unlikely)
-                                        pad_size = shallow_shape[0] - cropped_weight.shape[0]
-                                        cropped_weight = torch.cat([cropped_weight, torch.zeros(pad_size, *cropped_weight.shape[1:], device=cropped_weight.device)], dim=0)
-                                    
-                                    model_state[shallow_key] = cropped_weight
-                                    loaded_keys.append(shallow_key)
-                                    print(f"  ✓ Cropped {shallow_key} <- {pretrained_key} ({pretrained_shape} -> {cropped_weight.shape})")
-                                elif shallow_shape[1] == 1 and pretrained_shape[1] > 1:
-                                    # Adapt single-channel to multi-channel by averaging
-                                    adapted_weight = pretrained_weight.mean(dim=1, keepdim=True)
-                                    if adapted_weight.shape[0] == shallow_shape[0]:
-                                        model_state[shallow_key] = adapted_weight
-                                        loaded_keys.append(shallow_key)
-                                        print(f"  ✓ Adapted {shallow_key} <- {pretrained_key} (averaged channels)")
-                            except Exception as e:
-                                print(f"  ⚠ Failed to adapt {shallow_key}: {e}")
-                                continue
-                
-                # Third pass: try to load batch norm layers if they exist
-                for k, v in state_dict.items():
-                    clean_key = k.replace('module.', '')
-                    if ('bn' in clean_key or 'batch' in clean_key) and clean_key in model_state:
-                        if model_state[clean_key].shape == v.shape:
-                            model_state[clean_key] = v
-                            loaded_keys.append(clean_key)
-                
-                first_learner.load_state_dict(model_state)
-                
-                total_keys = len(state_dict)
-                print(f"✓ Loaded {len(loaded_keys)}/{total_keys} keys from pretrained model")
-                
-                if len(loaded_keys) == 0:
-                    print("⚠ No compatible weights found. Using random initialization.")
-                    print("   This is normal when loading complex models into simple architectures.")
-                elif len(loaded_keys) < 5:
-                    print("⚠ Only a few weights loaded. The pretrained model may have different architecture.")
-                    print("   Continuing with partial initialization...")
-                else:
-                    print("✓ Successfully loaded pretrained weights!")
-                    
-            except Exception as e:
-                print(f"⚠ Failed to load pretrained weights: {e}")
-                print("Continuing with randomly initialized first learner")
-        
-        self.weak_learners.append(first_learner)
+        self.weak_learners.append(weak_learner_factory(input_channels))
         
         # Track which boosters are active
         self.num_active_boosters = 1
@@ -370,6 +247,13 @@ class GradientBoostingSegmentation(nn.Module):
             # For segmentation, we can pass residuals as additional channels
             new_input_channels = self.input_channels + self.num_active_boosters
             new_learner = self.weak_learner_factory(new_input_channels)
+            
+            # Ensure the new learner is on the same device as existing learners
+            if len(self.weak_learners) > 0:
+                device = next(self.weak_learners[0].parameters()).device
+                new_learner = new_learner.to(device)
+                print(f"  Moving new learner to device: {device}")
+            
             self.weak_learners.append(new_learner)
             self.num_active_boosters += 1
             return True
@@ -407,7 +291,17 @@ class GradientBoostingSegmentation(nn.Module):
         
         if return_all_predictions:
             return current_pred, predictions
-        return current_pred
+        else:
+            return current_pred
+        
+    def to(self, *args, **kwargs):
+        """Override to() to ensure all weak learners are moved to the same device."""
+        super().to(*args, **kwargs)
+        # Ensure all weak learners are on the same device
+        device = next(self.parameters()).device
+        for i, learner in enumerate(self.weak_learners):
+            self.weak_learners[i] = learner.to(device)
+        return self
 
 # ----------------------------
 # Specialized Loss for Gradient Boosting
@@ -614,6 +508,15 @@ def get_args():
     parser.add_argument("--learning-rate-boost", type=float, default=0.1, help="Boosting learning rate")
     parser.add_argument("--base-channels", type=int, default=32, help="Base channels for weak learners")
     
+    # Pre-trained checkpoint
+    parser.add_argument("--pretrained-checkpoint", type=str, default=None,
+                        help="Path to pre-trained checkpoint (e.g., checkpoints/best.pth)")
+    parser.add_argument("--use-pretrained-as-first-booster", action="store_true",
+                        help="Use pre-trained model as first booster instead of random init")
+    parser.add_argument("--pretrained-booster-mode", choices=["transfer", "direct", "frozen"], 
+                        default="transfer",
+                        help="How to use pre-trained model: transfer weights, use directly, or freeze weights")
+    
     # Training
     parser.add_argument("--boosting-epochs-per-stage", type=int, default=15, 
                         help="Epochs to train each booster")
@@ -627,9 +530,186 @@ def get_args():
     # Output
     parser.add_argument("--outdir", default="checkpoints/gradient_boosting", help="Output directory")
     parser.add_argument("--logdir", default="runs/gradient_boosting", help="TensorBoard log directory")
-    parser.add_argument("--pretrained", type=str, default=None, help="Path to pretrained model weights to initialize first booster")
     
     return parser.parse_args()
+
+def transfer_weights_to_shallow_network(pretrained_model, shallow_model, method="adaptive"):
+    """
+    Transfer weights from pre-trained model to shallow network.
+
+    Args:
+        pretrained_model: Pre-trained model (e.g., UNet, ResNet)
+        shallow_model: Target shallow network
+        method: Transfer method - "adaptive", "direct", or "feature_extraction"
+
+    Returns:
+        shallow_model with transferred weights, or pretrained_model if transfer fails
+    """
+    print(f"Transferring weights using method: {method}")
+
+    if method == "adaptive":
+        # Adaptive weight transfer - map similar layers
+        pretrained_state = pretrained_model.state_dict()
+        shallow_state = shallow_model.state_dict()
+
+        transferred_layers = 0
+        total_layers = 0
+
+        # Enhanced mapping for different architectures
+        layer_mappings = {
+            # UNet style mappings
+            'encoder1': ['enc1', 'encoder1', 'down1', 'conv1'],
+            'encoder2': ['enc2', 'encoder2', 'down2', 'conv2'],
+            'decoder1': ['dec1', 'decoder1', 'up1', 'upconv1'],
+            'decoder2': ['dec2', 'decoder2', 'up2', 'upconv2'],
+            'bottleneck': ['bottleneck', 'bridge', 'center', 'middle'],
+
+            # ResNet style mappings
+            'conv1': ['initial', 'conv1', 'stem'],
+            'layer1': ['blocks', 'layer1', 'resblock1'],
+            'layer2': ['layer2', 'resblock2'],
+            'layer3': ['layer3', 'resblock3'],
+            'layer4': ['layer4', 'resblock4'],
+
+            # Batch norm mappings
+            'bn1': ['bn', 'batch_norm', 'norm1'],
+            'bn2': ['bn2', 'norm2'],
+            'bn3': ['bn3', 'norm3'],
+        }
+
+        for shallow_key in shallow_state.keys():
+            total_layers += 1
+            shallow_key_lower = shallow_key.lower()
+
+            # Try different mapping strategies
+            possible_keys = [shallow_key]  # Direct match first
+
+            # Add mapped variations
+            for pretrained_pattern, shallow_patterns in layer_mappings.items():
+                if any(pattern in shallow_key_lower for pattern in shallow_patterns):
+                    possible_keys.extend([k for k in pretrained_state.keys()
+                                        if pretrained_pattern.lower() in k.lower()])
+
+            # Try substring matching for common patterns
+            for pretrained_key in pretrained_state.keys():
+                pretrained_lower = pretrained_key.lower()
+                if ('conv' in shallow_key_lower and 'conv' in pretrained_lower and
+                    pretrained_state[pretrained_key].shape == shallow_state[shallow_key].shape):
+                    possible_keys.append(pretrained_key)
+                elif ('bn' in shallow_key_lower and 'bn' in pretrained_lower and
+                      pretrained_state[pretrained_key].shape == shallow_state[shallow_key].shape):
+                    possible_keys.append(pretrained_key)
+
+            # Remove duplicates while preserving order
+            seen = set()
+            possible_keys = [x for x in possible_keys if not (x in seen or seen.add(x))]
+
+            for possible_key in possible_keys[:10]:  # Limit to first 10 matches
+                if possible_key in pretrained_state:
+                    if pretrained_state[possible_key].shape == shallow_state[shallow_key].shape:
+                        shallow_state[shallow_key] = pretrained_state[possible_key]
+                        transferred_layers += 1
+                        print(f"  ✓ {shallow_key} <- {possible_key}")
+                        break
+                    else:
+                        print(f"  ⚠ Shape mismatch: {shallow_key} {shallow_state[shallow_key].shape} vs {possible_key} {pretrained_state[possible_key].shape}")
+
+        print(f"Transferred {transferred_layers}/{total_layers} layers")
+
+        # If very few layers transferred, fall back to feature extraction approach
+        if transferred_layers / total_layers < 0.1:
+            print("⚠ Very few layers transferred. Falling back to feature extraction approach.")
+            return create_feature_extractor_booster(pretrained_model, shallow_model)
+
+    elif method == "direct":
+        # Direct transfer for exact matches
+        pretrained_state = pretrained_model.state_dict()
+        shallow_state = shallow_model.state_dict()
+
+        transferred = 0
+        for key in shallow_state:
+            if key in pretrained_state and shallow_state[key].shape == pretrained_state[key].shape:
+                shallow_state[key] = pretrained_state[key]
+                transferred += 1
+
+        print(f"Direct transfer: {transferred} layers matched")
+
+    shallow_model.load_state_dict(shallow_state, strict=False)
+    return shallow_model
+
+def create_feature_extractor_booster(pretrained_model, shallow_model):
+    """
+    Create a booster that uses the pre-trained model for feature extraction
+    and a shallow network for final prediction.
+    """
+    print("Creating feature extraction booster...")
+
+    class FeatureExtractorBooster(nn.Module):
+        def __init__(self, pretrained, shallow):
+            super().__init__()
+            self.pretrained = pretrained
+            # Freeze pre-trained weights
+            for param in self.pretrained.parameters():
+                param.requires_grad = False
+
+            self.shallow = shallow
+            # Create adapter to match dimensions
+            self.adapter = nn.Sequential(
+                nn.Conv2d(1, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 1, 1)
+            )
+
+        def forward(self, x):
+            # Use pre-trained model for feature extraction
+            with torch.no_grad():
+                features = self.pretrained(x)
+            # Adapt features for shallow network
+            adapted = self.adapter(features)
+            # Final prediction with shallow network
+            return self.shallow(adapted)
+
+    return FeatureExtractorBooster(pretrained_model, shallow_model)
+
+def load_pretrained_checkpoint(checkpoint_path, device):
+    """
+    Load pre-trained checkpoint from segmentation_model.py training.
+    
+    Returns:
+        loaded_model: The pre-trained model
+        model_info: Information about the loaded model
+    """
+    print(f"Loading pre-trained checkpoint: {checkpoint_path}")
+    
+    # Import the load function from segmentation_model
+    from segmentation_model import load_model_from_checkpoint
+    
+    # Try to load with different model preferences
+    preferred_models = ["smp-unet-resnet34", "aca-atrous-unet", "connect-unet", "aca-atrous-resunet"]
+    
+    loaded_model = None
+    model_info = None
+    
+    for model_name in preferred_models:
+        try:
+            loaded_model, info, chosen = load_model_from_checkpoint(
+                checkpoint_path, 
+                preferred_model_name=model_name,
+                device=device,
+                img_size=512  # Default size
+            )
+            model_info = info
+            print(f"Successfully loaded model as: {chosen}")
+            break
+        except Exception as e:
+            print(f"Failed to load as {model_name}: {e}")
+            continue
+    
+    if loaded_model is None:
+        raise ValueError(f"Could not load checkpoint {checkpoint_path} with any known model type")
+    
+    return loaded_model, model_info
 
 def create_weak_learner_factory(args):
     """Create factory function for weak learners."""
@@ -669,12 +749,89 @@ def main():
         weak_learner_factory=weak_learner_factory,
         num_boosters=args.num_boosters,
         learning_rate=args.learning_rate_boost,
-        input_channels=1,
-        pretrained_path=args.pretrained,
-        device=device
+        input_channels=1
     ).to(device)
     
-    print(f"Created gradient boosting model with {args.weak_learner} weak learners")
+    # Load pre-trained checkpoint if specified
+    if args.pretrained_checkpoint and args.use_pretrained_as_first_booster:
+        print(f"\n{'='*60}")
+        print("LOADING PRE-TRAINED CHECKPOINT")
+        print(f"{'='*60}")
+        
+        try:
+            # Load the pre-trained model
+            pretrained_model, model_info = load_pretrained_checkpoint(args.pretrained_checkpoint, device)
+            print(f"Pre-trained model info:\n{model_info}")
+            
+            if args.pretrained_booster_mode == "transfer":
+                # Try weight transfer first
+                first_booster = weak_learner_factory(input_channels=1)
+                transferred_booster = transfer_weights_to_shallow_network(
+                    pretrained_model, first_booster, method="adaptive"
+                )
+                
+                # Check transfer success
+                pretrained_state = pretrained_model.state_dict()
+                transferred_state = transferred_booster.state_dict()
+                transferred_count = sum(1 for k in transferred_state.keys() 
+                                      if k in pretrained_state and 
+                                      torch.equal(transferred_state[k], pretrained_state[k]))
+                transfer_ratio = transferred_count / len(transferred_state)
+                
+                if transfer_ratio > 0.1:
+                    model.weak_learners[0] = transferred_booster.to(device)
+                    print("✓ Successfully transferred pre-trained weights to first booster!")
+                else:
+                    print("⚠ Weight transfer ineffective. Using pre-trained model directly.")
+                    args.pretrained_booster_mode = "direct"
+                    
+            if args.pretrained_booster_mode == "direct":
+                # Use pre-trained model directly as first booster
+                class PretrainedBoosterWrapper(nn.Module):
+                    def __init__(self, pretrained_model):
+                        super().__init__()
+                        self.model = pretrained_model
+                        
+                    def forward(self, x):
+                        output = self.model(x)
+                        # Handle case where model returns tuple (some models do this)
+                        if isinstance(output, tuple):
+                            return output[0]  # Return main output
+                        return output
+                
+                model.weak_learners[0] = PretrainedBoosterWrapper(pretrained_model).to(device)
+                print("✓ Using pre-trained model directly as first booster!")
+                
+            elif args.pretrained_booster_mode == "frozen":
+                # Use pre-trained model with frozen weights
+                class FrozenPretrainedBooster(nn.Module):
+                    def __init__(self, pretrained_model):
+                        super().__init__()
+                        self.model = pretrained_model
+                        # Freeze all weights
+                        for param in self.model.parameters():
+                            param.requires_grad = False
+                            
+                    def forward(self, x):
+                        output = self.model(x)
+                        # Handle case where model returns tuple (some models do this)
+                        if isinstance(output, tuple):
+                            return output[0]  # Return main output
+                        return output
+                
+                model.weak_learners[0] = FrozenPretrainedBooster(pretrained_model).to(device)
+                print("✓ Using pre-trained model as first booster (weights frozen)!")
+            
+            print(f"  Mode: {args.pretrained_booster_mode}")
+            print("  Gradient boosting will start with your trained model and add shallow networks to correct errors.")
+            
+        except Exception as e:
+            print(f"✗ Failed to load pre-trained checkpoint: {e}")
+            print("  Continuing with randomly initialized boosters...")
+    
+    print(f"\nCreated gradient boosting model with {args.weak_learner} weak learners")
+    if args.pretrained_checkpoint and args.use_pretrained_as_first_booster:
+        print("  First booster initialized with pre-trained weights")
     
     # Loss and optimizer
     from segmentation_model import DiceBCELoss
@@ -698,7 +855,10 @@ def main():
         args=args
     )
     
-    print("Starting gradient boosting training...")
+    print("\nStarting gradient boosting training...")
+    if args.pretrained_checkpoint and args.use_pretrained_as_first_booster:
+        print("💡 Tip: Since you're using a pre-trained first booster, the initial dice score should be close to your checkpoint's performance!")
+    
     trainer.run()
 
 if __name__ == "__main__":
