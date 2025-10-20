@@ -373,34 +373,91 @@ class GradientBoostingTrainer:
         self.boosting_epochs_per_stage = args.boosting_epochs_per_stage
         self.add_booster_threshold = args.add_booster_threshold
         
+        # Performance optimizations
+        self.gradient_accumulation_steps = args.gradient_accumulation_steps
+        self.mixed_precision = args.mixed_precision
+        self.validation_frequency = args.validation_frequency
+        
+        # Setup mixed precision
+        if self.mixed_precision:
+            try:
+                from torch.cuda.amp import GradScaler
+                self.scaler = GradScaler()
+                print("✓ Mixed precision training enabled")
+            except ImportError:
+                print("⚠ Mixed precision not available, continuing with FP32")
+                self.mixed_precision = False
+        else:
+            self.scaler = None
+        
         os.makedirs(args.outdir, exist_ok=True)
     
     def _train_epoch(self, epoch: int, stage: int):
-        """Train one epoch for gradient boosting."""
+        """Train one epoch for gradient boosting with memory optimizations."""
         self.model.train()
         total_loss = 0.0
         
         pbar = tqdm(self.train_loader, desc=f"Stage {stage} Epoch {epoch}")
         
+        self.optimizer.zero_grad()
+        
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs, masks = imgs.to(self.device), masks.to(self.device)
             
-            self.optimizer.zero_grad()
+            # Mixed precision forward pass
+            if self.mixed_precision and self.scaler:
+                with torch.cuda.amp.autocast():
+                    # Forward pass with all predictions
+                    ensemble_pred, individual_preds = self.model(imgs, return_all_predictions=True)
+                    
+                    # Compute loss
+                    loss = self.criterion(ensemble_pred, masks, pos_weight=self.pos_weight, 
+                                        individual_preds=individual_preds)
+                    
+                    # Add L1 regularization
+                    l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
+                    total_loss_with_reg = loss + l1_penalty
+                
+                # Scale loss for gradient accumulation
+                loss_to_accumulate = total_loss_with_reg / self.gradient_accumulation_steps
+                
+                # Backward pass with scaler
+                self.scaler.scale(loss_to_accumulate).backward()
+            else:
+                # Standard forward pass
+                ensemble_pred, individual_preds = self.model(imgs, return_all_predictions=True)
+                
+                # Compute loss
+                loss = self.criterion(ensemble_pred, masks, pos_weight=self.pos_weight, 
+                                    individual_preds=individual_preds)
+                
+                # Add L1 regularization
+                l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
+                total_loss_with_reg = loss + l1_penalty
+                
+                # Scale loss for gradient accumulation
+                loss_to_accumulate = total_loss_with_reg / self.gradient_accumulation_steps
+                
+                # Backward pass
+                loss_to_accumulate.backward()
             
-            # Forward pass with all predictions
-            ensemble_pred, individual_preds = self.model(imgs, return_all_predictions=True)
-            
-            # Compute loss
-            loss = self.criterion(ensemble_pred, masks, pos_weight=self.pos_weight, 
-                                individual_preds=individual_preds)
-            
-            # Add L1 regularization
-            l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
-            total_loss_with_reg = loss + l1_penalty
-            
-            total_loss_with_reg.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+            # Gradient accumulation step
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if self.mixed_precision and self.scaler:
+                    # Unscale gradients and clip
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step with scaler
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard gradient clipping and optimizer step
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
             
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", 
@@ -442,7 +499,7 @@ class GradientBoostingTrainer:
         return avg_val_dice
     
     def run(self):
-        """Main training loop with staged boosting."""
+        """Main training loop with staged boosting and performance optimizations."""
         stage = 0
         epoch = 0
         
@@ -460,17 +517,26 @@ class GradientBoostingTrainer:
             for stage_epoch in range(self.boosting_epochs_per_stage):
                 epoch += 1
                 
-                # Train and validate
+                # Train epoch
                 train_loss = self._train_epoch(epoch, stage)
-                val_dice = self._validate_epoch(epoch, stage)
                 
-                stage_best_dice = max(stage_best_dice, val_dice)
-                
-                print(f"Epoch {epoch}: Loss={train_loss:.4f}, "
-                      f"Dice={val_dice:.4f}, Best={stage_best_dice:.4f}")
+                # Validate only every N epochs to reduce computation
+                val_dice = None
+                if epoch % self.validation_frequency == 0 or stage_epoch == self.boosting_epochs_per_stage - 1:
+                    val_dice = self._validate_epoch(epoch, stage)
+                    stage_best_dice = max(stage_best_dice, val_dice)
+                    print(f"Epoch {epoch}: Loss={train_loss:.4f}, Dice={val_dice:.4f}, Best={stage_best_dice:.4f}")
+                else:
+                    print(f"Epoch {epoch}: Loss={train_loss:.4f} (validation skipped)")
                 
                 if self.scheduler:
                     self.scheduler.step()
+            
+            # Use the best dice from this stage for booster decision
+            if val_dice is None:
+                # If we didn't validate in the last epoch, validate now
+                val_dice = self._validate_epoch(epoch, stage)
+                stage_best_dice = max(stage_best_dice, val_dice)
             
             # Decide whether to add another booster
             if (stage_best_dice > self.add_booster_threshold and 
@@ -497,16 +563,16 @@ def get_args():
     
     # Data
     parser.add_argument("--csv", required=True, help="Path to dataset CSV")
-    parser.add_argument("--img-size", type=int, default=512, help="Image size")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
-    parser.add_argument("--num-workers", type=int, default=4, help="Data loader workers")
+    parser.add_argument("--img-size", type=int, default=256, help="Image size (reduced from 512 for memory efficiency)")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size (reduced from 8 for memory efficiency)")
+    parser.add_argument("--num-workers", type=int, default=2, help="Data loader workers (reduced from 4 for CPU efficiency)")
     
     # Model
     parser.add_argument("--weak-learner", choices=["shallow-unet", "shallow-resnet", "shallow-dense"], 
                         default="shallow-unet", help="Type of weak learner")
-    parser.add_argument("--num-boosters", type=int, default=8, help="Maximum number of boosters")
+    parser.add_argument("--num-boosters", type=int, default=5, help="Maximum number of boosters (reduced from 8)")
     parser.add_argument("--learning-rate-boost", type=float, default=0.1, help="Boosting learning rate")
-    parser.add_argument("--base-channels", type=int, default=32, help="Base channels for weak learners")
+    parser.add_argument("--base-channels", type=int, default=16, help="Base channels for weak learners (reduced from 32)")
     
     # Pre-trained checkpoint
     parser.add_argument("--pretrained-checkpoint", type=str, default=None,
@@ -514,18 +580,30 @@ def get_args():
     parser.add_argument("--use-pretrained-as-first-booster", action="store_true",
                         help="Use pre-trained model as first booster instead of random init")
     parser.add_argument("--pretrained-booster-mode", choices=["transfer", "direct", "frozen"], 
-                        default="transfer",
+                        default="direct",
                         help="How to use pre-trained model: transfer weights, use directly, or freeze weights")
     
     # Training
-    parser.add_argument("--boosting-epochs-per-stage", type=int, default=15, 
-                        help="Epochs to train each booster")
+    parser.add_argument("--boosting-epochs-per-stage", type=int, default=8, 
+                        help="Epochs to train each booster (reduced from 15)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--add-booster-threshold", type=float, default=0.1, 
-                        help="Minimum dice improvement to add booster")
+    parser.add_argument("--add-booster-threshold", type=float, default=0.05, 
+                        help="Minimum dice improvement to add booster (reduced from 0.1)")
     parser.add_argument("--pos-weight", type=float, default=11.0, help="Positive class weight")
     parser.add_argument("--l1-lambda", type=float, default=1e-5, help="L1 regularization")
-    parser.add_argument("--diversity-weight", type=float, default=0.05, help="Diversity loss weight")
+    parser.add_argument("--diversity-weight", type=float, default=0.02, help="Diversity loss weight (reduced from 0.05)")
+    
+    # Performance optimizations
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=2, 
+                        help="Gradient accumulation steps to reduce memory usage")
+    parser.add_argument("--mixed-precision", action="store_true", 
+                        help="Use mixed precision training (reduces memory and speeds up training)")
+    parser.add_argument("--validation-frequency", type=int, default=2,
+                        help="Run validation every N epochs instead of every epoch")
+    parser.add_argument("--disable-augmentation", action="store_true",
+                        help="Disable data augmentation to reduce CPU usage")
+    parser.add_argument("--pin-memory", action="store_true", default=False,
+                        help="Use pinned memory (set to False for CPU bottleneck)")
     
     # Output
     parser.add_argument("--outdir", default="checkpoints/gradient_boosting", help="Output directory")
@@ -732,16 +810,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
-    # Data loaders
-    dataset = BreastSegDataset(args.csv, resize=(args.img_size, args.img_size), augment=True)
+    # Performance optimizations info
+    print("🚀 Performance Optimizations:")
+    print(f"  - Image size: {args.img_size}x{args.img_size}")
+    print(f"  - Batch size: {args.batch_size}")
+    print(f"  - Workers: {args.num_workers}")
+    print(f"  - Gradient accumulation: {args.gradient_accumulation_steps} steps")
+    print(f"  - Mixed precision: {'Enabled' if args.mixed_precision else 'Disabled'}")
+    print(f"  - Validation frequency: Every {args.validation_frequency} epochs")
+    print(f"  - Augmentation: {'Disabled' if args.disable_augmentation else 'Enabled'}")
+    
+    # Data loaders with optimizations
+    augment = not args.disable_augmentation
+    dataset = BreastSegDataset(args.csv, resize=(args.img_size, args.img_size), augment=augment)
     val_len = int(len(dataset) * 0.2)
     train_len = len(dataset) - val_len
     train_ds, val_ds = random_split(dataset, [train_len, val_len])
     
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True)
+                              num_workers=args.num_workers, pin_memory=args.pin_memory)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, pin_memory=True)
+                            num_workers=args.num_workers, pin_memory=args.pin_memory)
     
     # Create model
     weak_learner_factory = create_weak_learner_factory(args)
