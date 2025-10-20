@@ -241,7 +241,7 @@ class GradientBoostingSegmentation(nn.Module):
             print(f"Loading pretrained weights from: {pretrained_path}")
             try:
                 # Load checkpoint
-                checkpoint = torch.load(pretrained_path, map_location=self.device)
+                checkpoint = torch.load(pretrained_path, map_location=self.device, weights_only=False)
                 
                 # Handle different checkpoint formats
                 if isinstance(checkpoint, dict):
@@ -252,26 +252,108 @@ class GradientBoostingSegmentation(nn.Module):
                     else:
                         state_dict = checkpoint
                 
-                # Try to load weights with shape matching
+                # Smart loading: try to match layers by pattern and shape
                 model_state = first_learner.state_dict()
                 loaded_keys = []
                 skipped_keys = []
                 
+                # First pass: exact matches
                 for k, v in state_dict.items():
-                    # Remove 'module.' prefix if present
                     clean_key = k.replace('module.', '')
-                    
                     if clean_key in model_state and model_state[clean_key].shape == v.shape:
                         model_state[clean_key] = v
                         loaded_keys.append(clean_key)
                     else:
                         skipped_keys.append(k)
                 
-                first_learner.load_state_dict(model_state)
-                print(f"✓ Loaded {len(loaded_keys)}/{len(loaded_keys) + len(skipped_keys)} keys from pretrained model")
+                # Second pass: try to match by layer patterns (e.g., first conv layers)
+                if len(loaded_keys) == 0:  # If no exact matches, try pattern matching
+                    print("No exact matches found, trying pattern-based loading...")
+                    
+                    # Get shallow network's conv layers (only weight parameters)
+                    shallow_convs = [(k, model_state[k]) for k in model_state.keys() 
+                                   if 'conv' in k and k.endswith('.weight') and len(model_state[k].shape) == 4]
+                    
+                    # Get pretrained conv layers (prioritize early layers)
+                    pretrained_convs = [(k, v) for k, v in state_dict.items() 
+                                      if 'conv' in k and k.endswith('.weight') and len(v.shape) == 4]
+                    pretrained_convs.sort(key=lambda x: x[0])  # Sort by name
+                    
+                    print(f"Found {len(shallow_convs)} shallow conv layers, {len(pretrained_convs)} pretrained conv layers")
+                    
+                    # Try to match first few conv layers
+                    for i, (shallow_key, shallow_weight) in enumerate(shallow_convs):
+                        if i < len(pretrained_convs):
+                            pretrained_key, pretrained_weight = pretrained_convs[i]
+                            
+                            # Check if shapes are compatible
+                            shallow_shape = shallow_weight.shape
+                            pretrained_shape = pretrained_weight.shape
+                            
+                            try:
+                                if shallow_shape == pretrained_shape:
+                                    model_state[shallow_key] = pretrained_weight
+                                    loaded_keys.append(shallow_key)
+                                    print(f"  ✓ Matched {shallow_key} <- {pretrained_key}")
+                                elif (shallow_shape[1] == pretrained_shape[1] and 
+                                      shallow_shape[0] <= pretrained_shape[0]):
+                                    # Can use subset of output channels
+                                    model_state[shallow_key] = pretrained_weight[:shallow_shape[0]]
+                                    loaded_keys.append(shallow_key)
+                                    print(f"  ✓ Adapted {shallow_key} <- {pretrained_key} ({pretrained_shape} -> {shallow_shape})")
+                                elif (shallow_shape[1] == pretrained_shape[1] and 
+                                      pretrained_shape[2] >= shallow_shape[2] and 
+                                      pretrained_shape[3] >= shallow_shape[3]):
+                                    # Try center crop for kernel size (e.g., 7x7 -> 3x3)
+                                    h_diff = pretrained_shape[2] - shallow_shape[2]
+                                    w_diff = pretrained_shape[3] - shallow_shape[3]
+                                    h_start = h_diff // 2
+                                    w_start = w_diff // 2
+                                    cropped_weight = pretrained_weight[:, :, h_start:h_start+shallow_shape[2], w_start:w_start+shallow_shape[3]]
+                                    
+                                    # Handle output channel mismatch
+                                    if cropped_weight.shape[0] > shallow_shape[0]:
+                                        cropped_weight = cropped_weight[:shallow_shape[0]]
+                                    elif cropped_weight.shape[0] < shallow_shape[0]:
+                                        # Pad with zeros if needed (unlikely)
+                                        pad_size = shallow_shape[0] - cropped_weight.shape[0]
+                                        cropped_weight = torch.cat([cropped_weight, torch.zeros(pad_size, *cropped_weight.shape[1:], device=cropped_weight.device)], dim=0)
+                                    
+                                    model_state[shallow_key] = cropped_weight
+                                    loaded_keys.append(shallow_key)
+                                    print(f"  ✓ Cropped {shallow_key} <- {pretrained_key} ({pretrained_shape} -> {cropped_weight.shape})")
+                                elif shallow_shape[1] == 1 and pretrained_shape[1] > 1:
+                                    # Adapt single-channel to multi-channel by averaging
+                                    adapted_weight = pretrained_weight.mean(dim=1, keepdim=True)
+                                    if adapted_weight.shape[0] == shallow_shape[0]:
+                                        model_state[shallow_key] = adapted_weight
+                                        loaded_keys.append(shallow_key)
+                                        print(f"  ✓ Adapted {shallow_key} <- {pretrained_key} (averaged channels)")
+                            except Exception as e:
+                                print(f"  ⚠ Failed to adapt {shallow_key}: {e}")
+                                continue
                 
-                if len(skipped_keys) > 0:
-                    print(f"⚠ Skipped {len(skipped_keys)} keys (shape mismatch)")
+                # Third pass: try to load batch norm layers if they exist
+                for k, v in state_dict.items():
+                    clean_key = k.replace('module.', '')
+                    if ('bn' in clean_key or 'batch' in clean_key) and clean_key in model_state:
+                        if model_state[clean_key].shape == v.shape:
+                            model_state[clean_key] = v
+                            loaded_keys.append(clean_key)
+                
+                first_learner.load_state_dict(model_state)
+                
+                total_keys = len(state_dict)
+                print(f"✓ Loaded {len(loaded_keys)}/{total_keys} keys from pretrained model")
+                
+                if len(loaded_keys) == 0:
+                    print("⚠ No compatible weights found. Using random initialization.")
+                    print("   This is normal when loading complex models into simple architectures.")
+                elif len(loaded_keys) < 5:
+                    print("⚠ Only a few weights loaded. The pretrained model may have different architecture.")
+                    print("   Continuing with partial initialization...")
+                else:
+                    print("✓ Successfully loaded pretrained weights!")
                     
             except Exception as e:
                 print(f"⚠ Failed to load pretrained weights: {e}")
